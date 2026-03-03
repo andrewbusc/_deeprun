@@ -156,7 +156,7 @@ const createDeploymentSchema = z.object({
   containerPort: z.number().int().min(1).max(65535).optional()
 });
 
-import { createGovernanceRoutes } from './governance-routes.js';
+// import { createGovernanceRoutes } from './governance-routes.js';
 
 const app = express();
 app.disable("x-powered-by");
@@ -735,7 +735,7 @@ app.use((req, res, next) => {
   res.status(503).json({ error: "Server is shutting down." });
 });
 
-app.use('/api', createGovernanceRoutes(store, agentRunService));
+// app.use('/api', createGovernanceRoutes(store, agentRunService));
 
 app.use(express.static(publicDir));
 

@@ -60,6 +60,7 @@ import {
   AgentRunCorrectionPolicyTelemetryEntry,
   AgentRunCorrectionTelemetryEntry,
   AgentRunDetail,
+  AgentRunExecutionContractMaterial,
   AgentStep,
   AgentStepExecution,
   AgentStepRecord,
@@ -484,7 +485,7 @@ export class AgentKernel {
     return {
       schemaVersion,
       hash,
-      material,
+      material: material as AgentRunExecutionContractMaterial | null,
       effectiveConfig,
       fallbackUsed,
       fallbackFields,

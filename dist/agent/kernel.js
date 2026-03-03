@@ -2,8 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import ts from "typescript";
 import { pathExists, readTextFile, safeResolvePath } from "../lib/fs-utils.js";
-import { ensureRunWorktree, isWorktreeDirty, listCommits, readCurrentCommitHash, resetWorktreeToCommit } from "../lib/git-versioning.js";
+import { ensureRunWorktree, isWorktreeDirty, listCommits, readCurrentCommitHash, resolveCommitHash, resetWorktreeToCommit } from "../lib/git-versioning.js";
 import { logInfo, logWarn, serializeError } from "../lib/logging.js";
+import { ProviderRegistry } from "../lib/providers.js";
 import { appendLearningJsonl, writeSnapshot, writeStubDebtArtifact } from "../learning/learning-writer.js";
 import { summarizeStubDebt } from "../learning/stub-debt.js";
 import { getTemplate, getTemplateValidationProfile } from "../templates/catalog.js";
@@ -20,6 +21,8 @@ import { analyzeProjectForMemory } from "./memory.js";
 import { AgentPlanner } from "./planner.js";
 import { isExecutingAgentRunStatus } from "./run-status.js";
 import { createDefaultAgentToolRegistry } from "./tools/index.js";
+import { buildExecutionContractMaterialForSchema, buildExecutionContract, evaluateExecutionContractSupport, ExecutionContractMismatchError, hashExecutionContractMaterial, persistedExecutionConfigNeedsNormalization, resolveExecutionConfig as resolveExecutionConfigContract } from "./execution-contract.js";
+import { readBasEnv } from "./bas-env.js";
 import { withAgentPlanCapabilities } from "./types.js";
 function truncateText(value, maxLength) {
     const normalized = value.replace(/\s+/g, " ").trim();
@@ -104,86 +107,65 @@ export class AgentKernel {
     planner;
     executor;
     store;
+    providers;
     constructor(input) {
         this.store = input.store;
+        this.providers = input.providers ?? new ProviderRegistry();
         this.planner = input.planner ?? new AgentPlanner();
-        this.executor = input.executor ?? new AgentExecutor(createDefaultAgentToolRegistry({ providers: input.providers }));
+        this.executor = input.executor ?? new AgentExecutor(createDefaultAgentToolRegistry({ providers: this.providers }));
     }
     resolveMaxRuntimeCorrectionAttempts() {
-        const parsed = Number(process.env.AGENT_GOAL_MAX_CORRECTIONS || process.env.AGENT_RUNTIME_MAX_CORRECTIONS || 5);
+        const parsed = Number(readBasEnv({ key: "AGENT_GOAL_MAX_CORRECTIONS", file: "src/agent/kernel.ts" }) ||
+            readBasEnv({ key: "AGENT_RUNTIME_MAX_CORRECTIONS", file: "src/agent/kernel.ts" }) ||
+            5);
         if (!Number.isFinite(parsed)) {
             return 5;
         }
         return Math.min(5, Math.max(0, Math.floor(parsed)));
     }
     resolveMaxHeavyCorrectionAttempts() {
-        const parsed = Number(process.env.AGENT_OPTIMIZATION_MAX_CORRECTIONS || process.env.AGENT_HEAVY_MAX_CORRECTIONS || 3);
+        const parsed = Number(readBasEnv({ key: "AGENT_OPTIMIZATION_MAX_CORRECTIONS", file: "src/agent/kernel.ts" }) ||
+            readBasEnv({ key: "AGENT_HEAVY_MAX_CORRECTIONS", file: "src/agent/kernel.ts" }) ||
+            3);
         if (!Number.isFinite(parsed)) {
             return 3;
         }
         return Math.min(3, Math.max(0, Math.floor(parsed)));
     }
-    parseExecutionValidationMode(value) {
-        if (value === "off" || value === "warn" || value === "enforce") {
-            return value;
-        }
-        return null;
-    }
-    parseExecutionProfile(value) {
-        if (value === "full" || value === "ci" || value === "smoke") {
-            return value;
-        }
-        return null;
-    }
-    parseBoundedInt(value, min, max) {
-        const parsed = Number(value);
-        if (!Number.isFinite(parsed)) {
-            return null;
-        }
-        return Math.min(max, Math.max(min, Math.floor(parsed)));
-    }
     resolvePlannerTimeoutMs() {
-        const parsed = Number(process.env.DEEPRUN_PLANNER_TIMEOUT_MS || 120_000);
+        const parsed = Number(readBasEnv({ key: "DEEPRUN_PLANNER_TIMEOUT_MS", file: "src/agent/kernel.ts" }) || 120_000);
         if (!Number.isFinite(parsed)) {
             return 120_000;
         }
         return Math.min(300_000, Math.max(1_000, Math.floor(parsed)));
     }
-    executionConfigPreset(profile) {
-        switch (profile) {
-            case "ci":
-                return {
-                    lightValidationMode: "off",
-                    heavyValidationMode: "off",
-                    maxRuntimeCorrectionAttempts: 0,
-                    maxHeavyCorrectionAttempts: 0,
-                    correctionPolicyMode: "warn",
-                    correctionConvergenceMode: "warn",
-                    plannerTimeoutMs: 5_000
-                };
-            case "smoke":
-                return {
-                    lightValidationMode: "warn",
-                    heavyValidationMode: "warn",
-                    maxRuntimeCorrectionAttempts: 1,
-                    maxHeavyCorrectionAttempts: 1,
-                    correctionPolicyMode: "warn",
-                    correctionConvergenceMode: "warn",
-                    plannerTimeoutMs: 10_000
-                };
-            case "full":
-            default:
-                return {};
+    resolveMaxFilesPerStep() {
+        const parsed = Number(readBasEnv({ key: "AGENT_FS_MAX_FILES_PER_STEP", file: "src/agent/kernel.ts" }) || 15);
+        if (!Number.isFinite(parsed)) {
+            return 15;
         }
+        return Math.min(100, Math.max(1, Math.floor(parsed)));
     }
-    resolveExecutionConfig(input) {
-        const metadata = this.toRecord(input?.metadata);
-        const metadataExecutionConfig = this.toRecord(metadata?.executionConfig);
-        const overrideExecutionConfig = input?.executionConfig && typeof input.executionConfig === "object" ? input.executionConfig : null;
-        const rawConfig = overrideExecutionConfig || metadataExecutionConfig || {};
-        const profile = this.parseExecutionProfile(rawConfig.profile) || "full";
-        const resolved = {
-            profile,
+    resolveMaxTotalDiffBytes() {
+        const parsed = Number(readBasEnv({ key: "AGENT_FS_MAX_TOTAL_DIFF_BYTES", file: "src/agent/kernel.ts" }) || 400_000);
+        if (!Number.isFinite(parsed)) {
+            return 400_000;
+        }
+        return Math.min(10_000_000, Math.max(1_000, Math.floor(parsed)));
+    }
+    resolveMaxFileBytes() {
+        const parsed = Number(readBasEnv({ key: "AGENT_FS_MAX_FILE_BYTES", file: "src/agent/kernel.ts" }) || 1_500_000);
+        if (!Number.isFinite(parsed)) {
+            return 1_500_000;
+        }
+        return Math.min(20_000_000, Math.max(1_000, Math.floor(parsed)));
+    }
+    resolveAllowEnvMutation() {
+        return readBasEnv({ key: "AGENT_FS_ALLOW_ENV_MUTATION", file: "src/agent/kernel.ts" }) === "true";
+    }
+    buildExecutionConfigEnvFallback() {
+        return {
+            profile: "full",
             lightValidationMode: this.resolveLightValidationMode(),
             heavyValidationMode: this.resolveHeavyValidationMode(),
             maxRuntimeCorrectionAttempts: this.resolveMaxRuntimeCorrectionAttempts(),
@@ -191,46 +173,213 @@ export class AgentKernel {
             correctionPolicyMode: this.resolveCorrectionPolicyMode(),
             correctionConvergenceMode: this.resolveCorrectionConvergenceMode(),
             plannerTimeoutMs: this.resolvePlannerTimeoutMs(),
-            ...this.executionConfigPreset(profile)
+            maxFilesPerStep: this.resolveMaxFilesPerStep(),
+            maxTotalDiffBytes: this.resolveMaxTotalDiffBytes(),
+            maxFileBytes: this.resolveMaxFileBytes(),
+            allowEnvMutation: this.resolveAllowEnvMutation()
         };
-        const lightValidationMode = this.parseExecutionValidationMode(rawConfig.lightValidationMode);
-        if (lightValidationMode) {
-            resolved.lightValidationMode = lightValidationMode;
-        }
-        const heavyValidationMode = this.parseExecutionValidationMode(rawConfig.heavyValidationMode);
-        if (heavyValidationMode) {
-            resolved.heavyValidationMode = heavyValidationMode;
-        }
-        const correctionPolicyMode = this.parseExecutionValidationMode(rawConfig.correctionPolicyMode);
-        if (correctionPolicyMode) {
-            resolved.correctionPolicyMode = correctionPolicyMode;
-        }
-        const correctionConvergenceMode = this.parseExecutionValidationMode(rawConfig.correctionConvergenceMode);
-        if (correctionConvergenceMode) {
-            resolved.correctionConvergenceMode = correctionConvergenceMode;
-        }
-        const maxRuntimeCorrectionAttempts = this.parseBoundedInt(rawConfig.maxRuntimeCorrectionAttempts, 0, 5);
-        if (maxRuntimeCorrectionAttempts !== null) {
-            resolved.maxRuntimeCorrectionAttempts = maxRuntimeCorrectionAttempts;
-        }
-        const maxHeavyCorrectionAttempts = this.parseBoundedInt(rawConfig.maxHeavyCorrectionAttempts, 0, 3);
-        if (maxHeavyCorrectionAttempts !== null) {
-            resolved.maxHeavyCorrectionAttempts = maxHeavyCorrectionAttempts;
-        }
-        const plannerTimeoutMs = this.parseBoundedInt(rawConfig.plannerTimeoutMs, 1_000, 300_000);
-        if (plannerTimeoutMs !== null) {
-            resolved.plannerTimeoutMs = plannerTimeoutMs;
-        }
-        if ((input?.executionProfile || "default") === "builder") {
-            resolved.lightValidationMode = "off";
-            resolved.heavyValidationMode = "off";
-        }
-        return resolved;
+    }
+    resolveExecutionContract(input) {
+        return resolveExecutionConfigContract(this.toRecord(this.toRecord(input?.metadata)?.executionConfig), input?.executionConfig || null, this.buildExecutionConfigEnvFallback(), {
+            executionProfile: input?.executionProfile
+        });
+    }
+    resolveExecutionConfig(input) {
+        return this.resolveExecutionContract(input).requestedExecutionConfig;
+    }
+    readExecutionContractMetadata(metadata) {
+        const record = this.toRecord(metadata) || {};
+        const schemaVersion = typeof record.executionContractSchemaVersion === "number" ? Math.floor(record.executionContractSchemaVersion) : null;
+        const hash = typeof record.executionContractHash === "string" && record.executionContractHash.trim() ? record.executionContractHash.trim() : null;
+        const materialRecord = this.toRecord(record.executionContractMaterial);
+        const effectiveConfigRecord = this.toRecord(record.effectiveExecutionConfig);
+        const effectiveConfig = effectiveConfigRecord ? this.resolveExecutionConfig({ executionConfig: effectiveConfigRecord }) : null;
+        const fallbackUsed = typeof record.executionContractFallbackUsed === "boolean" ? record.executionContractFallbackUsed : null;
+        const fallbackFields = Array.isArray(record.executionContractFallbackFields)
+            ? record.executionContractFallbackFields.filter((field) => typeof field === "string")
+            : [];
+        const supportRecord = this.toRecord(record.executionContractSupport);
+        const support = supportRecord && typeof supportRecord.supported === "boolean"
+            ? {
+                supported: supportRecord.supported,
+                ...(supportRecord.code === "UNSUPPORTED_CONTRACT" ? { code: "UNSUPPORTED_CONTRACT" } : {}),
+                ...(typeof supportRecord.message === "string" && supportRecord.message.trim()
+                    ? { message: supportRecord.message.trim() }
+                    : {}),
+                ...(this.toRecord(supportRecord.details) ? { details: this.toRecord(supportRecord.details) || undefined } : {})
+            }
+            : null;
+        const material = materialRecord &&
+            typeof materialRecord.executionContractSchemaVersion === "number" &&
+            this.toRecord(materialRecord.normalizedExecutionConfig)
+            ? {
+                executionContractSchemaVersion: Math.floor(materialRecord.executionContractSchemaVersion),
+                normalizedExecutionConfig: this.resolveExecutionConfig({
+                    executionConfig: this.toRecord(materialRecord.normalizedExecutionConfig)
+                }),
+                ...(Math.floor(materialRecord.executionContractSchemaVersion) === 1
+                    ? {
+                        determinismPolicyVersion: typeof materialRecord.determinismPolicyVersion === "number"
+                            ? Math.floor(materialRecord.determinismPolicyVersion)
+                            : 0,
+                        plannerPolicyVersion: typeof materialRecord.plannerPolicyVersion === "number"
+                            ? Math.floor(materialRecord.plannerPolicyVersion)
+                            : 0,
+                        correctionRecipeVersion: typeof materialRecord.correctionRecipeVersion === "number"
+                            ? Math.floor(materialRecord.correctionRecipeVersion)
+                            : 0,
+                        validationPolicyVersion: typeof materialRecord.validationPolicyVersion === "number"
+                            ? Math.floor(materialRecord.validationPolicyVersion)
+                            : 0,
+                        randomnessSeed: typeof materialRecord.randomnessSeed === "string" ? materialRecord.randomnessSeed : "unknown"
+                    }
+                    : {
+                        randomnessSeed: typeof materialRecord.randomnessSeed === "string" ? materialRecord.randomnessSeed : "unknown",
+                        policyVersions: {
+                            determinismPolicyVersion: typeof this.toRecord(materialRecord.policyVersions)?.determinismPolicyVersion === "number"
+                                ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.determinismPolicyVersion))
+                                : 0,
+                            normalizationPolicyVersion: typeof this.toRecord(materialRecord.policyVersions)?.normalizationPolicyVersion === "number"
+                                ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.normalizationPolicyVersion))
+                                : 0,
+                            plannerPolicyVersion: typeof this.toRecord(materialRecord.policyVersions)?.plannerPolicyVersion === "number"
+                                ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.plannerPolicyVersion))
+                                : 0,
+                            correctionRecipeVersion: typeof this.toRecord(materialRecord.policyVersions)?.correctionRecipeVersion === "number"
+                                ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.correctionRecipeVersion))
+                                : 0,
+                            validationPolicyVersion: typeof this.toRecord(materialRecord.policyVersions)?.validationPolicyVersion === "number"
+                                ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.validationPolicyVersion))
+                                : 0,
+                            governancePolicyVersion: typeof this.toRecord(materialRecord.policyVersions)?.governancePolicyVersion === "number"
+                                ? Math.floor(Number(this.toRecord(materialRecord.policyVersions)?.governancePolicyVersion))
+                                : 0
+                        }
+                    })
+            }
+            : null;
+        return {
+            schemaVersion,
+            hash,
+            material: material,
+            effectiveConfig,
+            fallbackUsed,
+            fallbackFields,
+            support
+        };
     }
     withExecutionConfigMetadata(metadata, executionConfig) {
+        const contract = buildExecutionContract(executionConfig);
+        const support = evaluateExecutionContractSupport(contract.material);
         return {
             ...(this.toRecord(metadata) || {}),
-            executionConfig
+            executionConfig: contract.effectiveConfig,
+            executionContractSchemaVersion: contract.schemaVersion,
+            executionContractHash: contract.hash,
+            executionContractMaterial: contract.material,
+            effectiveExecutionConfig: contract.effectiveConfig,
+            executionContractFallbackUsed: contract.fallbackUsed,
+            executionContractFallbackFields: contract.fallbackFields,
+            executionContractSupport: support
+        };
+    }
+    withResolvedExecutionContractMetadata(metadata, resolvedContract) {
+        const support = evaluateExecutionContractSupport(resolvedContract.material);
+        return {
+            ...(this.toRecord(metadata) || {}),
+            executionConfig: resolvedContract.effectiveConfig,
+            executionContractSchemaVersion: resolvedContract.schemaVersion,
+            executionContractHash: resolvedContract.hash,
+            executionContractMaterial: resolvedContract.material,
+            effectiveExecutionConfig: resolvedContract.effectiveConfig,
+            executionContractFallbackUsed: resolvedContract.fallbackUsed,
+            executionContractFallbackFields: resolvedContract.fallbackFields,
+            executionContractSupport: support
+        };
+    }
+    assertStoredExecutionContract(run, resolvedContract) {
+        const stored = this.readExecutionContractMetadata(run.metadata);
+        if (stored.schemaVersion === null ||
+            stored.hash === null ||
+            stored.effectiveConfig === null ||
+            stored.fallbackUsed === null) {
+            return;
+        }
+        const expectedMaterial = buildExecutionContractMaterialForSchema({
+            config: resolvedContract.effectiveConfig,
+            contractSchemaVersion: stored.schemaVersion
+        });
+        if (stored.schemaVersion !== expectedMaterial.executionContractSchemaVersion ||
+            JSON.stringify(stored.effectiveConfig) !== JSON.stringify(resolvedContract.effectiveConfig) ||
+            stored.hash !== hashExecutionContractMaterial(expectedMaterial) ||
+            (stored.material !== null && JSON.stringify(stored.material) !== JSON.stringify(expectedMaterial))) {
+            throw new Error(`CONTRACT_MISMATCH: stored execution contract metadata does not match persisted normalized config for run ${run.id}.`);
+        }
+    }
+    assertSupportedExecutionContract(run, resolvedContract) {
+        const stored = this.readExecutionContractMetadata(run.metadata);
+        const support = stored.support || evaluateExecutionContractSupport(stored.material || resolvedContract.material);
+        if (!support.supported) {
+            throw new Error(`UNSUPPORTED_CONTRACT: ${support.message || `worker cannot execute run ${run.id}`}`);
+        }
+    }
+    resolveEffectiveModel(providerId, model) {
+        const trimmed = typeof model === "string" ? model.trim() : "";
+        if (trimmed) {
+            return trimmed;
+        }
+        return this.providers.get(providerId).descriptor.defaultModel;
+    }
+    async prepareResumeExecutionConfig(input) {
+        let run = input.run;
+        const rawPersistedExecutionConfig = this.toRecord(this.toRecord(run.metadata)?.executionConfig);
+        const storedContractMetadata = this.readExecutionContractMetadata(run.metadata);
+        let resolvedContract = this.resolveExecutionContract({
+            metadata: { executionConfig: rawPersistedExecutionConfig || null },
+            executionConfig: input.executionConfig || null
+        });
+        this.assertStoredExecutionContract(run, resolvedContract.persistedContract);
+        const persistedNeedsNormalization = storedContractMetadata.schemaVersion === null ||
+            storedContractMetadata.hash === null ||
+            storedContractMetadata.effectiveConfig === null ||
+            storedContractMetadata.fallbackUsed === null ||
+            storedContractMetadata.support === null ||
+            persistedExecutionConfigNeedsNormalization(rawPersistedExecutionConfig, resolvedContract.persistedExecutionConfig, this.buildExecutionConfigEnvFallback());
+        if (persistedNeedsNormalization) {
+            run =
+                (await this.store.updateAgentRun(run.id, {
+                    metadata: this.withResolvedExecutionContractMetadata(run.metadata, resolvedContract.persistedContract)
+                })) || run;
+            resolvedContract = this.resolveExecutionContract({
+                metadata: run.metadata,
+                executionConfig: input.executionConfig || null
+            });
+        }
+        const persistedExecutionConfig = resolvedContract.persistedExecutionConfig;
+        const requestedExecutionConfig = resolvedContract.requestedExecutionConfig;
+        const requestedDiffers = resolvedContract.diff.length > 0;
+        if (requestedDiffers && !input.overrideExecutionConfig && !input.fork) {
+            throw new ExecutionContractMismatchError({
+                persisted: persistedExecutionConfig,
+                requested: requestedExecutionConfig,
+                diff: resolvedContract.diff
+            });
+        }
+        if (requestedDiffers && input.overrideExecutionConfig && !input.fork) {
+            run =
+                (await this.store.updateAgentRun(run.id, {
+                    metadata: this.withResolvedExecutionContractMetadata(run.metadata, resolvedContract.requestedContract)
+                })) || run;
+            return {
+                run,
+                persistedExecutionConfig: requestedExecutionConfig,
+                resumeExecutionConfig: requestedExecutionConfig
+            };
+        }
+        return {
+            run,
+            persistedExecutionConfig,
+            resumeExecutionConfig: requestedExecutionConfig
         };
     }
     isMutatingStep(step) {
@@ -2043,9 +2192,29 @@ export class AgentKernel {
                 ...(correctionPolicy ? { correctionPolicy } : {})
             };
         });
+        const recomputedContract = this.resolveExecutionContract({
+            metadata: run.metadata
+        }).requestedContract;
+        const storedContract = this.readExecutionContractMetadata(run.metadata);
+        const resolvedContract = storedContract.schemaVersion !== null &&
+            storedContract.hash !== null &&
+            storedContract.effectiveConfig !== null &&
+            storedContract.fallbackUsed !== null
+            ? {
+                schemaVersion: storedContract.schemaVersion,
+                hash: storedContract.hash,
+                material: storedContract.material || recomputedContract.material,
+                effectiveConfig: storedContract.effectiveConfig,
+                fallbackUsed: storedContract.fallbackUsed,
+                fallbackFields: storedContract.fallbackFields,
+                ...(storedContract.support ? { support: storedContract.support } : {})
+            }
+            : recomputedContract;
         return {
             run: attachLastStep(run, enrichedSteps),
             steps: enrichedSteps,
+            executionConfigSummary: resolvedContract.effectiveConfig,
+            contract: resolvedContract,
             telemetry: {
                 corrections,
                 correctionPolicies
@@ -2152,35 +2321,43 @@ export class AgentKernel {
         }
     }
     resolveLightValidationMode() {
-        const raw = (process.env.AGENT_LIGHT_VALIDATION_MODE || "enforce").trim().toLowerCase();
+        const raw = (readBasEnv({ key: "AGENT_LIGHT_VALIDATION_MODE", file: "src/agent/kernel.ts" }) || "enforce")
+            .trim()
+            .toLowerCase();
         if (raw === "off" || raw === "warn" || raw === "enforce") {
             return raw;
         }
         return "enforce";
     }
     resolveHeavyValidationMode() {
-        const raw = (process.env.AGENT_HEAVY_VALIDATION_MODE || "enforce").trim().toLowerCase();
+        const raw = (readBasEnv({ key: "AGENT_HEAVY_VALIDATION_MODE", file: "src/agent/kernel.ts" }) || "enforce")
+            .trim()
+            .toLowerCase();
         if (raw === "off" || raw === "warn" || raw === "enforce") {
             return raw;
         }
         return "enforce";
     }
     resolveCorrectionPolicyMode() {
-        const raw = (process.env.AGENT_CORRECTION_POLICY_MODE || "enforce").trim().toLowerCase();
+        const raw = (readBasEnv({ key: "AGENT_CORRECTION_POLICY_MODE", file: "src/agent/kernel.ts" }) || "enforce")
+            .trim()
+            .toLowerCase();
         if (raw === "off" || raw === "warn" || raw === "enforce") {
             return raw;
         }
         return "enforce";
     }
     resolveCorrectionConvergenceMode() {
-        const raw = (process.env.AGENT_CORRECTION_CONVERGENCE_MODE || "enforce").trim().toLowerCase();
+        const raw = (readBasEnv({ key: "AGENT_CORRECTION_CONVERGENCE_MODE", file: "src/agent/kernel.ts" }) || "enforce")
+            .trim()
+            .toLowerCase();
         if (raw === "off" || raw === "warn" || raw === "enforce") {
             return raw;
         }
         return "enforce";
     }
     resolveRunLockStaleSeconds() {
-        const parsed = Number(process.env.AGENT_RUN_LOCK_STALE_SECONDS || 1800);
+        const parsed = Number(readBasEnv({ key: "AGENT_RUN_LOCK_STALE_SECONDS", file: "src/agent/kernel.ts" }) || 1800);
         if (!Number.isFinite(parsed)) {
             return 1800;
         }
@@ -2338,8 +2515,8 @@ export class AgentKernel {
             runtimeLogs: input.runtimeLogs,
             failureReport: input.failureReport,
             limits: {
-                maxFilesPerStep: Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15),
-                maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000)
+                maxFilesPerStep: input.executionConfig.maxFilesPerStep,
+                maxTotalDiffBytes: input.executionConfig.maxTotalDiffBytes
             }
         });
         const correction = await this.planner.planRuntimeCorrection({
@@ -2415,8 +2592,8 @@ export class AgentKernel {
             runtimeLogs: `${input.heavyValidationSummary}\n\n${input.heavyValidationLogs}`.trim(),
             failureReport: input.heavyFailureReport,
             limits: {
-                maxFilesPerStep: Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15),
-                maxTotalDiffBytes: Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000)
+                maxFilesPerStep: input.executionConfig.maxFilesPerStep,
+                maxTotalDiffBytes: input.executionConfig.maxTotalDiffBytes
             }
         });
         const correction = await this.planner.planRuntimeCorrection({
@@ -2582,17 +2759,15 @@ export class AgentKernel {
             let lastHeavyBlockingCount = null;
             const lightValidationMode = executionConfig.lightValidationMode;
             const heavyValidationMode = executionConfig.heavyValidationMode;
-            const maxFilesPerStep = Number(process.env.AGENT_FS_MAX_FILES_PER_STEP || 15);
-            const maxTotalDiffBytes = Number(process.env.AGENT_FS_MAX_TOTAL_DIFF_BYTES || 400_000);
             const fileSession = await FileSession.create({
                 projectId: run.projectId,
                 projectRoot,
                 baseCommitHash: run.currentCommitHash || run.baseCommitHash || undefined,
                 options: {
-                    maxFilesPerStep,
-                    maxTotalDiffBytes,
-                    maxFileBytes: Number(process.env.AGENT_FS_MAX_FILE_BYTES || 1_500_000),
-                    allowEnvMutation: process.env.AGENT_FS_ALLOW_ENV_MUTATION === "true"
+                    maxFilesPerStep: executionConfig.maxFilesPerStep,
+                    maxTotalDiffBytes: executionConfig.maxTotalDiffBytes,
+                    maxFileBytes: executionConfig.maxFileBytes,
+                    allowEnvMutation: executionConfig.allowEnvMutation
                 }
             });
             for (let stepIndex = run.currentStepIndex; stepIndex < run.plan.steps.length; stepIndex += 1) {
@@ -2920,8 +3095,8 @@ export class AgentKernel {
                         commitHash,
                         outputPayload: output,
                         resolvedConstraint: correctionConstraint,
-                        maxFilesPerStep,
-                        maxTotalDiffBytes
+                        maxFilesPerStep: executionConfig.maxFilesPerStep,
+                        maxTotalDiffBytes: executionConfig.maxTotalDiffBytes
                     });
                     output = {
                         ...output,
@@ -3608,11 +3783,13 @@ export class AgentKernel {
     async createAndExecuteRun(input) {
         const runId = randomUUID();
         const plan = withAgentPlanCapabilities(input.plan);
-        const resolvedExecutionConfig = this.resolveExecutionConfig({
+        const resolvedExecutionContract = this.resolveExecutionContract({
             metadata: input.metadata,
             executionConfig: input.executionConfig,
             executionProfile: input.executionProfile
         });
+        const resolvedExecutionConfig = resolvedExecutionContract.requestedExecutionConfig;
+        const resolvedModel = this.resolveEffectiveModel(input.providerId, input.model);
         let run = await this.store.createAgentRun({
             runId,
             projectId: input.project.id,
@@ -3621,11 +3798,11 @@ export class AgentKernel {
             createdByUserId: input.createdByUserId,
             goal: input.goal,
             providerId: input.providerId,
-            model: input.model,
+            model: resolvedModel,
             status: plan.steps.length ? "queued" : "complete",
             currentStepIndex: 0,
             plan,
-            metadata: this.withExecutionConfigMetadata(input.metadata, resolvedExecutionConfig),
+            metadata: this.withResolvedExecutionContractMetadata(input.metadata, resolvedExecutionContract.requestedContract),
             errorMessage: null,
             finishedAt: plan.steps.length ? null : new Date().toISOString()
         });
@@ -3649,6 +3826,7 @@ export class AgentKernel {
             projectId: input.project.id,
             goal: input.goal,
             providerId: input.providerId,
+            model: resolvedModel,
             planStepCount: run.plan.steps.length,
             currentStepIndex: run.currentStepIndex,
             status: run.status,
@@ -3661,16 +3839,19 @@ export class AgentKernel {
             run: detail.run,
             steps: detail.steps,
             telemetry: detail.telemetry,
+            executionConfigSummary: detail.executionConfigSummary,
             executedStep
         };
     }
     async createQueuedRun(input) {
         const runId = randomUUID();
         const plan = withAgentPlanCapabilities(input.plan);
-        const resolvedExecutionConfig = this.resolveExecutionConfig({
+        const resolvedExecutionContract = this.resolveExecutionContract({
             metadata: input.metadata,
             executionConfig: input.executionConfig
         });
+        const resolvedExecutionConfig = resolvedExecutionContract.requestedExecutionConfig;
+        const resolvedModel = this.resolveEffectiveModel(input.providerId, input.model);
         const run = await this.store.createAgentRun({
             runId,
             projectId: input.project.id,
@@ -3679,11 +3860,11 @@ export class AgentKernel {
             createdByUserId: input.createdByUserId,
             goal: input.goal,
             providerId: input.providerId,
-            model: input.model,
+            model: resolvedModel,
             status: plan.steps.length ? "queued" : "complete",
             currentStepIndex: 0,
             plan,
-            metadata: this.withExecutionConfigMetadata(input.metadata, resolvedExecutionConfig),
+            metadata: this.withResolvedExecutionContractMetadata(input.metadata, resolvedExecutionContract.requestedContract),
             errorMessage: null,
             finishedAt: plan.steps.length ? null : new Date().toISOString()
         });
@@ -3702,6 +3883,7 @@ export class AgentKernel {
             projectId: input.project.id,
             goal: input.goal,
             providerId: input.providerId,
+            model: resolvedModel,
             planStepCount: run.plan.steps.length,
             currentStepIndex: run.currentStepIndex,
             status: run.status,
@@ -3713,6 +3895,7 @@ export class AgentKernel {
             run: detail.run,
             steps: detail.steps,
             telemetry: detail.telemetry,
+            executionConfigSummary: detail.executionConfigSummary,
             queuedJob
         };
     }
@@ -3722,6 +3905,7 @@ export class AgentKernel {
             metadata: null,
             executionConfig: input.executionConfig
         });
+        const resolvedModel = this.resolveEffectiveModel(input.providerId, input.model);
         const plannerMemory = await this.buildPlannerMemoryContext({
             project: input.project,
             projectRoot,
@@ -3730,7 +3914,7 @@ export class AgentKernel {
         const plan = await this.planner.plan({
             goal: input.goal,
             providerId: input.providerId,
-            model: input.model,
+            model: resolvedModel,
             project: input.project,
             projectRoot,
             memory: plannerMemory,
@@ -3741,7 +3925,7 @@ export class AgentKernel {
             createdByUserId: input.createdByUserId,
             goal: input.goal,
             providerId: input.providerId,
-            model: input.model,
+            model: resolvedModel,
             plan,
             requestId: input.requestId,
             plannerMemory,
@@ -3756,6 +3940,7 @@ export class AgentKernel {
             metadata: null,
             executionConfig: input.executionConfig
         });
+        const resolvedModel = this.resolveEffectiveModel(input.providerId, input.model);
         const plannerMemory = await this.buildPlannerMemoryContext({
             project: input.project,
             projectRoot,
@@ -3764,7 +3949,7 @@ export class AgentKernel {
         const plan = await this.planner.plan({
             goal: input.goal,
             providerId: input.providerId,
-            model: input.model,
+            model: resolvedModel,
             project: input.project,
             projectRoot,
             memory: plannerMemory,
@@ -3775,7 +3960,7 @@ export class AgentKernel {
             createdByUserId: input.createdByUserId,
             goal: input.goal,
             providerId: input.providerId,
-            model: input.model,
+            model: resolvedModel,
             plan,
             requestId: input.requestId,
             executionConfig: resolvedExecutionConfig
@@ -3802,16 +3987,25 @@ export class AgentKernel {
             throw new Error("Agent run not found.");
         }
         const normalizedExisting = await this.ensurePlanCapabilitiesPersisted(existing);
-        if (normalizedExisting.status === "complete") {
-            const steps = await this.store.listAgentStepsByRun(normalizedExisting.id);
-            return this.buildRunDetail(normalizedExisting, steps);
+        const prepared = await this.prepareResumeExecutionConfig({
+            run: normalizedExisting,
+            executionConfig: input.executionConfig,
+            overrideExecutionConfig: input.overrideExecutionConfig,
+            fork: input.fork
+        });
+        if (input.fork) {
+            throw new Error("Forked resume is only supported through queueResumeRun.");
         }
-        const run = (await this.store.updateAgentRun(normalizedExisting.id, {
+        if (prepared.run.status === "complete") {
+            const steps = await this.store.listAgentStepsByRun(prepared.run.id);
+            return this.buildRunDetail(prepared.run, steps);
+        }
+        const run = (await this.store.updateAgentRun(prepared.run.id, {
             status: "queued",
             errorMessage: null,
             errorDetails: null,
             finishedAt: null
-        })) || normalizedExisting;
+        })) || prepared.run;
         const plannerMemory = await this.buildPlannerMemoryContext({
             project: input.project,
             projectRoot: this.store.getProjectWorkspacePath(input.project),
@@ -3822,9 +4016,7 @@ export class AgentKernel {
             project: input.project,
             requestId: input.requestId,
             plannerMemory,
-            executionConfig: this.resolveExecutionConfig({
-                metadata: run.metadata
-            })
+            executionConfig: prepared.persistedExecutionConfig
         });
         logInfo("agent.run.resumed", {
             requestId: input.requestId,
@@ -3841,16 +4033,34 @@ export class AgentKernel {
             throw new Error("Agent run not found.");
         }
         const normalizedExisting = await this.ensurePlanCapabilitiesPersisted(existing);
-        const steps = await this.store.listAgentStepsByRun(normalizedExisting.id);
-        if (normalizedExisting.status === "complete") {
-            return this.buildRunDetail(normalizedExisting, steps);
+        const prepared = await this.prepareResumeExecutionConfig({
+            run: normalizedExisting,
+            executionConfig: input.executionConfig,
+            overrideExecutionConfig: input.overrideExecutionConfig,
+            fork: input.fork
+        });
+        const steps = await this.store.listAgentStepsByRun(prepared.run.id);
+        if (prepared.run.status === "complete" && !input.fork) {
+            return this.buildRunDetail(prepared.run, steps);
         }
-        const run = (await this.store.updateAgentRun(normalizedExisting.id, {
+        if (input.fork) {
+            if (!input.createdByUserId) {
+                throw new Error("Forked resume requires createdByUserId.");
+            }
+            return this.forkRunForResume({
+                sourceRun: prepared.run,
+                project: input.project,
+                createdByUserId: input.createdByUserId,
+                requestId: input.requestId,
+                executionConfig: prepared.resumeExecutionConfig
+            });
+        }
+        const run = (await this.store.updateAgentRun(prepared.run.id, {
             status: "queued",
             errorMessage: null,
             errorDetails: null,
             finishedAt: null
-        })) || normalizedExisting;
+        })) || prepared.run;
         const queuedJob = await this.store.enqueueRunJob({
             runId: run.id,
             jobType: "kernel",
@@ -3865,6 +4075,78 @@ export class AgentKernel {
             status: detail.run.status,
             currentStepIndex: detail.run.currentStepIndex,
             queuedJobId: queuedJob.id
+        });
+        return {
+            ...detail,
+            queuedJob
+        };
+    }
+    async forkRunForResume(input) {
+        const workspaceRoot = this.store.getProjectWorkspacePath(input.project);
+        const resumeCommitHash = input.sourceRun.currentCommitHash || input.sourceRun.lastValidCommitHash || input.sourceRun.baseCommitHash;
+        const commitLookupRoot = input.sourceRun.worktreePath || workspaceRoot;
+        const resolvedRunBranch = input.sourceRun.runBranch
+            ? (await resolveCommitHash(commitLookupRoot, input.sourceRun.runBranch)) ||
+                (await resolveCommitHash(workspaceRoot, input.sourceRun.runBranch))
+            : null;
+        const resolvedResumeCommitHash = resumeCommitHash
+            ? (await resolveCommitHash(commitLookupRoot, resumeCommitHash)) || (await resolveCommitHash(workspaceRoot, resumeCommitHash))
+            : null;
+        const resumeBaseRef = resolvedRunBranch || resolvedResumeCommitHash;
+        if (input.sourceRun.currentStepIndex > 0 && !resumeBaseRef) {
+            throw new Error("Source run has no persisted commit state and cannot be forked for resume.");
+        }
+        const forkRunId = randomUUID();
+        const forkWorktreePath = path.join(workspaceRoot, ".deeprun", "worktrees", forkRunId);
+        const repoRoot = input.sourceRun.worktreePath || workspaceRoot;
+        const forkContext = await ensureRunWorktree({
+            projectDir: repoRoot,
+            runId: forkRunId,
+            worktreePath: forkWorktreePath,
+            ...(resumeBaseRef ? { baseCommitHash: resumeBaseRef } : {})
+        });
+        const hasRemainingSteps = input.sourceRun.currentStepIndex < input.sourceRun.plan.steps.length;
+        const forkRun = await this.store.createAgentRun({
+            runId: forkRunId,
+            projectId: input.sourceRun.projectId,
+            orgId: input.sourceRun.orgId,
+            workspaceId: input.sourceRun.workspaceId,
+            createdByUserId: input.createdByUserId,
+            goal: input.sourceRun.goal,
+            providerId: input.sourceRun.providerId,
+            model: input.sourceRun.model,
+            status: hasRemainingSteps ? "queued" : "complete",
+            currentStepIndex: input.sourceRun.currentStepIndex,
+            plan: input.sourceRun.plan,
+            lastStepId: input.sourceRun.lastStepId || null,
+            runBranch: forkContext.runBranch,
+            worktreePath: forkContext.worktreePath,
+            baseCommitHash: forkContext.baseCommitHash,
+            currentCommitHash: forkContext.currentCommitHash,
+            lastValidCommitHash: forkContext.currentCommitHash || forkContext.baseCommitHash,
+            metadata: this.withExecutionConfigMetadata(input.sourceRun.metadata, input.executionConfig),
+            errorMessage: null,
+            errorDetails: null,
+            finishedAt: hasRemainingSteps ? null : new Date().toISOString()
+        });
+        const queuedJob = hasRemainingSteps
+            ? await this.store.enqueueRunJob({
+                runId: forkRun.id,
+                jobType: "kernel",
+                targetRole: "compute",
+                requiredCapabilities: null
+            })
+            : undefined;
+        const detail = this.buildRunDetail(forkRun, []);
+        logInfo("agent.run.resume_forked", {
+            requestId: input.requestId,
+            sourceRunId: input.sourceRun.id,
+            forkRunId: forkRun.id,
+            projectId: input.project.id,
+            status: forkRun.status,
+            currentStepIndex: forkRun.currentStepIndex,
+            executionConfig: input.executionConfig,
+            queuedJobId: queuedJob?.id || null
         });
         return {
             ...detail,
@@ -3888,10 +4170,15 @@ export class AgentKernel {
         }
         const forkRunId = randomUUID();
         const workspaceRoot = this.store.getProjectWorkspacePath(input.project);
+        const commitLookupRoot = sourceRun.worktreePath || workspaceRoot;
+        const sourceCommitHash = await resolveCommitHash(commitLookupRoot, sourceStep.commitHash);
+        if (!sourceCommitHash) {
+            throw new Error("Selected step commit hash could not be resolved for fork.");
+        }
         const forkContext = await ensureRunWorktree({
             projectDir: workspaceRoot,
             runId: forkRunId,
-            baseCommitHash: sourceStep.commitHash
+            baseCommitHash: sourceCommitHash
         });
         const nextStepIndex = Math.min(sourceStep.stepIndex + 1, sourceRun.plan.steps.length);
         const hasRemainingSteps = nextStepIndex < sourceRun.plan.steps.length;
@@ -3922,7 +4209,7 @@ export class AgentKernel {
             projectId: input.project.id,
             sourceRunId: sourceRun.id,
             sourceStepId: sourceStep.stepId,
-            sourceCommitHash: sourceStep.commitHash,
+            sourceCommitHash,
             forkRunId: forkRun.id,
             forkRunBranch: forkRun.runBranch,
             forkCurrentStepIndex: forkRun.currentStepIndex
@@ -3980,7 +4267,25 @@ export class AgentKernel {
         if (!run) {
             throw new Error(`Run not found: ${input.job.runId}`);
         }
-        const normalizedRun = await this.ensurePlanCapabilitiesPersisted(run);
+        let normalizedRun = await this.ensurePlanCapabilitiesPersisted(run);
+        const resolvedExecutionContract = this.resolveExecutionContract({
+            metadata: normalizedRun.metadata
+        });
+        const resolvedExecutionConfig = resolvedExecutionContract.requestedExecutionConfig;
+        this.assertSupportedExecutionContract(normalizedRun, resolvedExecutionContract.persistedContract);
+        this.assertStoredExecutionContract(normalizedRun, resolvedExecutionContract.persistedContract);
+        const storedContract = this.readExecutionContractMetadata(normalizedRun.metadata);
+        if (storedContract.schemaVersion === null ||
+            storedContract.hash === null ||
+            storedContract.effectiveConfig === null ||
+            storedContract.fallbackUsed === null ||
+            storedContract.support === null ||
+            persistedExecutionConfigNeedsNormalization(this.toRecord(this.toRecord(normalizedRun.metadata)?.executionConfig), resolvedExecutionConfig, this.buildExecutionConfigEnvFallback())) {
+            normalizedRun =
+                (await this.store.updateAgentRun(normalizedRun.id, {
+                    metadata: this.withResolvedExecutionContractMetadata(normalizedRun.metadata, resolvedExecutionContract.requestedContract)
+                })) || normalizedRun;
+        }
         if (normalizedRun.status === "complete" || normalizedRun.status === "cancelled") {
             const steps = await this.store.listAgentStepsByRun(normalizedRun.id);
             return this.buildRunDetail(normalizedRun, steps);

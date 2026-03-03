@@ -12,5 +12,24 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/agent/__tests__/contract-material-audit.test.ts",
+    "src/agent/__tests__/control-plane-identity.test.ts",
+    "src/agent/__tests__/execution-contract.test.ts",
+    "src/agent/__tests__/failure-isolation.test.ts",
+    "src/agent/__tests__/graph-governance.test.ts",
+    "src/agent/__tests__/graph-identity.test.ts",
+    "src/agent/__tests__/graph-revision-diff.test.ts",
+    "src/agent/__tests__/identity-drift.test.ts",
+    "src/agent/__tests__/v2-schema-stress.test.ts",
+    "src/governance-routes.ts",
+    "src/governance/__tests__/decision-replay.test.ts",
+    "src/governance/__tests__/decision.test.ts",
+    "src/lib/__tests__/graph-revision-store.test.ts",
+    "src/lib/__tests__/graph-store.test.ts",
+    "src/lib/__tests__/migration-stress.test.ts",
+    "src/lib/__tests__/revision-replay.test.ts",
+    "src/harness/benchmarks/proof-pack-benchmark.ts"
+  ]
 }

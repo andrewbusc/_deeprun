@@ -129,6 +129,10 @@ async function readRefHash(projectDir, ref) {
     const value = result.stdout.trim();
     return value || null;
 }
+export async function resolveCommitHash(projectDir, ref) {
+    await ensureGitRepo(projectDir);
+    return readRefHash(projectDir, ref);
+}
 async function readCurrentBranch(projectDir) {
     const result = await execGit(projectDir, ["rev-parse", "--abbrev-ref", "HEAD"], {
         allowFailure: true

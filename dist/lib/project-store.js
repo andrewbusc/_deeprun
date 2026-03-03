@@ -277,7 +277,7 @@ project_id, org_id, workspace_id, architecture_summary, stack_info,
 last_analyzed_at, created_at, updated_at
 `;
 const lifecycleRunSelectColumns = `
-id, project_id, org_id, workspace_id, created_by_user_id, goal, phase, status,
+id, project_id, org_id, workspace_id, created_by_user_id, graph_id, goal, phase, status,
 step_index, corrections_used, optimization_steps_used, max_steps, max_corrections,
 max_optimizations, error_message, created_at, updated_at
 `;
@@ -581,6 +581,7 @@ function mapLifecycleRun(row) {
         orgId: row.org_id,
         workspaceId: row.workspace_id,
         createdByUserId: row.created_by_user_id,
+        graphId: row.graph_id,
         goal: row.goal,
         phase: row.phase,
         status: row.status,
@@ -628,18 +629,27 @@ export class AppStore {
         });
     }
     async initialize() {
+        const client = await this.pool.connect();
         await ensureDir(this.workspaceDir);
-        await this.pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
-        await this.pool.query(schemaSql);
-        await this.migrateRunQueueCapabilitySchema();
-        await this.migrateAgentRunMetadataSchema();
-        await this.migrateLearningTelemetrySchema();
-        await this.migrateAgentStateMachineSchema();
-        await this.migrateAgentRunValidationSchema();
-        await this.migrateAgentRunCorrectionTrackingSchema();
-        await this.migrateDeploymentRunPinSchema();
-        await this.pruneExpiredSessions();
-        await this.markIncompleteDeploymentsFailed();
+        try {
+            await client.query(`SELECT pg_advisory_lock(74022101)`);
+            await client.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+            await client.query(schemaSql);
+            await this.migrateRunQueueCapabilitySchema(client);
+            await this.migrateAgentRunMetadataSchema(client);
+            await this.migrateLearningTelemetrySchema(client);
+            await this.migrateAgentStateMachineSchema(client);
+            await this.migrateAgentRunValidationSchema(client);
+            await this.migrateAgentRunCorrectionTrackingSchema(client);
+            await this.migrateDeploymentRunPinSchema(client);
+            await this.migrateExecutionGraphSchema(client);
+            await this.pruneExpiredSessions(client);
+            await this.markIncompleteDeploymentsFailed(client);
+        }
+        finally {
+            await client.query(`SELECT pg_advisory_unlock(74022101)`).catch(() => undefined);
+            client.release();
+        }
     }
     async close() {
         await this.pool.end();
@@ -668,8 +678,10 @@ export class AppStore {
         }
     }
     async runQuery(sql, values = [], client) {
-        const target = client ?? this.pool;
-        return target.query(sql, values);
+        if (client) {
+            return client.query(sql, values);
+        }
+        return this.pool.query(sql, values);
     }
     getProjectWorkspacePath(project) {
         return path.join(this.workspaceDir, project.orgId, project.workspaceId, project.id);
@@ -1060,18 +1072,18 @@ export class AppStore {
        SET logs = COALESCE(logs, '') || $2, updated_at = NOW()
        WHERE id = $1`, [deploymentId, content]);
     }
-    async markIncompleteDeploymentsFailed() {
-        await this.pool.query(`UPDATE deployments
+    async markIncompleteDeploymentsFailed(client) {
+        await this.runQuery(`UPDATE deployments
        SET
          status = 'failed',
          error_message = COALESCE(error_message, 'Deployment interrupted during server restart.'),
          finished_at = NOW(),
          updated_at = NOW(),
          is_active = FALSE
-       WHERE status IN ('queued', 'building', 'pushing', 'launching')`);
+       WHERE status IN ('queued', 'building', 'pushing', 'launching')`, [], client);
     }
-    async migrateAgentStateMachineSchema() {
-        await this.pool.query(`ALTER TABLE agent_runs
+    async migrateAgentStateMachineSchema(client) {
+        await this.runQuery(`ALTER TABLE agent_runs
        ADD COLUMN IF NOT EXISTS phase TEXT,
        ADD COLUMN IF NOT EXISTS step_index INTEGER,
        ADD COLUMN IF NOT EXISTS corrections_used INTEGER,
@@ -1086,8 +1098,8 @@ export class AppStore {
        ADD COLUMN IF NOT EXISTS last_valid_commit_hash TEXT,
        ADD COLUMN IF NOT EXISTS run_lock_owner TEXT,
        ADD COLUMN IF NOT EXISTS run_lock_acquired_at TIMESTAMPTZ,
-       ADD COLUMN IF NOT EXISTS error_details JSONB`);
-        await this.pool.query(`UPDATE agent_runs
+       ADD COLUMN IF NOT EXISTS error_details JSONB`, [], client);
+        await this.runQuery(`UPDATE agent_runs
        SET
          phase = COALESCE(phase, 'goal'),
          step_index = COALESCE(step_index, current_step_index, 0),
@@ -1103,8 +1115,8 @@ export class AppStore {
            WHEN 'cancelling' THEN 'cancelled'
            WHEN 'completed' THEN 'complete'
            ELSE status
-         END`);
-        await this.pool.query(`ALTER TABLE agent_runs
+         END`, [], client);
+        await this.runQuery(`ALTER TABLE agent_runs
        ALTER COLUMN phase SET DEFAULT 'goal',
        ALTER COLUMN phase SET NOT NULL,
        ALTER COLUMN step_index SET DEFAULT 0,
@@ -1118,8 +1130,8 @@ export class AppStore {
        ALTER COLUMN max_corrections SET DEFAULT 2,
        ALTER COLUMN max_corrections SET NOT NULL,
        ALTER COLUMN max_optimizations SET DEFAULT 2,
-       ALTER COLUMN max_optimizations SET NOT NULL`);
-        await this.pool.query(`DO $$
+       ALTER COLUMN max_optimizations SET NOT NULL`, [], client);
+        await this.runQuery(`DO $$
        DECLARE con RECORD;
        BEGIN
          FOR con IN
@@ -1134,41 +1146,41 @@ export class AppStore {
          LOOP
            EXECUTE format('ALTER TABLE agent_runs DROP CONSTRAINT IF EXISTS %I', con.conname);
          END LOOP;
-       END $$;`);
-        await this.pool.query(`DO $$
+       END $$;`, [], client);
+        await this.runQuery(`DO $$
        BEGIN
          ALTER TABLE agent_runs
          ADD CONSTRAINT agent_runs_status_check
          CHECK (status IN ('queued', 'running', 'correcting', 'optimizing', 'validating', 'cancelled', 'failed', 'complete'));
        EXCEPTION
          WHEN duplicate_object THEN NULL;
-       END $$;`);
-        await this.pool.query(`DO $$
+       END $$;`, [], client);
+        await this.runQuery(`DO $$
        BEGIN
          ALTER TABLE agent_runs
          ADD CONSTRAINT agent_runs_phase_check
          CHECK (phase IN ('goal', 'optimization'));
        EXCEPTION
          WHEN duplicate_object THEN NULL;
-       END $$;`);
-        await this.pool.query(`ALTER TABLE agent_steps
+       END $$;`, [], client);
+        await this.runQuery(`ALTER TABLE agent_steps
        ADD COLUMN IF NOT EXISTS attempt INTEGER,
        ADD COLUMN IF NOT EXISTS summary TEXT,
-       ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`);
-        await this.pool.query(`UPDATE agent_steps
+       ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`, [], client);
+        await this.runQuery(`UPDATE agent_steps
        SET
          attempt = COALESCE(attempt, 1),
          summary = COALESCE(summary, ''),
          status = CASE status
            WHEN 'completed' THEN 'complete'
            ELSE status
-         END`);
-        await this.pool.query(`ALTER TABLE agent_steps
+         END`, [], client);
+        await this.runQuery(`ALTER TABLE agent_steps
        ALTER COLUMN attempt SET DEFAULT 1,
        ALTER COLUMN attempt SET NOT NULL,
        ALTER COLUMN summary SET DEFAULT '',
-       ALTER COLUMN summary SET NOT NULL`);
-        await this.pool.query(`DO $$
+       ALTER COLUMN summary SET NOT NULL`, [], client);
+        await this.runQuery(`DO $$
        DECLARE con RECORD;
        BEGIN
          FOR con IN
@@ -1183,16 +1195,16 @@ export class AppStore {
          LOOP
            EXECUTE format('ALTER TABLE agent_steps DROP CONSTRAINT IF EXISTS %I', con.conname);
          END LOOP;
-       END $$;`);
-        await this.pool.query(`DO $$
+       END $$;`, [], client);
+        await this.runQuery(`DO $$
        BEGIN
          ALTER TABLE agent_steps
          ADD CONSTRAINT agent_steps_step_type_check
          CHECK (step_type IN ('goal', 'correction', 'optimization', 'analyze', 'modify', 'verify'));
        EXCEPTION
          WHEN duplicate_object THEN NULL;
-       END $$;`);
-        await this.pool.query(`DO $$
+       END $$;`, [], client);
+        await this.runQuery(`DO $$
        BEGIN
          ALTER TABLE agent_steps
          ADD CONSTRAINT agent_steps_status_check
@@ -1200,66 +1212,135 @@ export class AppStore {
        EXCEPTION
          WHEN duplicate_object THEN NULL;
        END $$;`);
-        await this.pool.query(`DO $$
+        await this.runQuery(`DO $$
        BEGIN
          ALTER TABLE agent_steps
          ADD CONSTRAINT agent_steps_attempt_positive_check
          CHECK (attempt >= 1);
        EXCEPTION
          WHEN duplicate_object THEN NULL;
-       END $$;`);
-        await this.pool.query(`DROP INDEX IF EXISTS idx_agent_steps_run_step_index;`);
-        await this.pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_steps_run_step_attempt_unique ON agent_steps (run_id, step_index, attempt);`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_agent_steps_run_step_index ON agent_steps (run_id, step_index);`);
+       END $$;`, [], client);
+        await this.runQuery(`DROP INDEX IF EXISTS idx_agent_steps_run_step_index;`, [], client);
+        await this.runQuery(`CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_steps_run_step_attempt_unique ON agent_steps (run_id, step_index, attempt);`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_agent_steps_run_step_index ON agent_steps (run_id, step_index);`, [], client);
     }
-    async migrateAgentRunValidationSchema() {
-        await this.pool.query(`ALTER TABLE agent_runs
+    async migrateAgentRunValidationSchema(client) {
+        await this.runQuery(`ALTER TABLE agent_runs
        ADD COLUMN IF NOT EXISTS validation_status TEXT CHECK (validation_status IN ('failed', 'passed')),
        ADD COLUMN IF NOT EXISTS validation_result JSONB,
-       ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ`);
+       ADD COLUMN IF NOT EXISTS validated_at TIMESTAMPTZ`, [], client);
     }
-    async migrateAgentRunCorrectionTrackingSchema() {
-        await this.pool.query(`ALTER TABLE agent_runs
+    async migrateAgentRunCorrectionTrackingSchema(client) {
+        await this.runQuery(`ALTER TABLE agent_runs
        ADD COLUMN IF NOT EXISTS correction_attempts INTEGER NOT NULL DEFAULT 0,
-       ADD COLUMN IF NOT EXISTS last_correction_reason TEXT`);
+       ADD COLUMN IF NOT EXISTS last_correction_reason TEXT`, [], client);
     }
-    async migrateDeploymentRunPinSchema() {
-        await this.pool.query(`ALTER TABLE deployments
+    async migrateDeploymentRunPinSchema(client) {
+        await this.runQuery(`ALTER TABLE deployments
        ADD COLUMN IF NOT EXISTS run_id UUID,
-       ADD COLUMN IF NOT EXISTS commit_hash TEXT`);
+       ADD COLUMN IF NOT EXISTS commit_hash TEXT`, [], client);
     }
-    async migrateRunQueueCapabilitySchema() {
-        await this.pool.query(`ALTER TABLE run_jobs
-       ADD COLUMN IF NOT EXISTS required_capabilities JSONB`);
-        await this.pool.query(`UPDATE run_jobs
+    async migrateExecutionGraphSchema(client) {
+        await this.runQuery(`DO $$
+       BEGIN
+         IF EXISTS (
+           SELECT 1 FROM information_schema.tables
+           WHERE table_name = 'execution_graphs'
+         ) AND NOT EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_name = 'execution_graphs' AND column_name = 'project_id'
+         ) THEN
+           DROP TABLE IF EXISTS execution_graphs CASCADE;
+         END IF;
+       END $$;`, [], client);
+        await this.runQuery(`CREATE TABLE IF NOT EXISTS execution_graphs (
+         id UUID PRIMARY KEY,
+         project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+         workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+         created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+         graph_identity_hash TEXT NOT NULL,
+         graph_schema_version INTEGER NOT NULL,
+         graph_policy_descriptor JSONB NOT NULL,
+         status TEXT NOT NULL CHECK (status IN ('created', 'running', 'complete', 'failed')),
+         created_at TIMESTAMPTZ NOT NULL,
+         updated_at TIMESTAMPTZ NOT NULL
+       )`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_execution_graphs_project_id ON execution_graphs (project_id)`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_execution_graphs_identity_hash ON execution_graphs (graph_identity_hash)`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_execution_graphs_status ON execution_graphs (status)`, [], client);
+        await this.runQuery(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS graph_id UUID`, [], client);
+        await this.runQuery(`DO $$
+       BEGIN
+         IF EXISTS (
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_name = 'agent_runs'
+             AND column_name = 'graph_id'
+             AND is_nullable = 'NO'
+         ) THEN
+           ALTER TABLE agent_runs ALTER COLUMN graph_id DROP NOT NULL;
+         END IF;
+       END $$;`, [], client);
+        await this.runQuery(`DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         DROP CONSTRAINT IF EXISTS agent_runs_graph_id_fkey;
+       EXCEPTION
+         WHEN undefined_object THEN NULL;
+       END $$;`, [], client);
+        await this.runQuery(`DO $$
+       BEGIN
+         ALTER TABLE agent_runs
+         ADD CONSTRAINT agent_runs_graph_id_fkey
+         FOREIGN KEY (graph_id) REFERENCES execution_graphs(id) ON DELETE SET NULL;
+       EXCEPTION
+         WHEN duplicate_object THEN NULL;
+       END $$;`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_agent_runs_graph_id ON agent_runs (graph_id)`, [], client);
+    }
+    async migrateRunQueueCapabilitySchema(client) {
+        await this.runQuery(`ALTER TABLE run_jobs
+       ADD COLUMN IF NOT EXISTS required_capabilities JSONB`, [], client);
+        await this.runQuery(`UPDATE run_jobs
        SET required_capabilities = NULL
-       WHERE required_capabilities = 'null'::jsonb`);
-        await this.pool.query(`ALTER TABLE run_jobs
-       DROP CONSTRAINT IF EXISTS run_jobs_required_capabilities_object_check`);
-        await this.pool.query(`ALTER TABLE run_jobs
-       ADD CONSTRAINT run_jobs_required_capabilities_object_check
-       CHECK (required_capabilities IS NULL OR jsonb_typeof(required_capabilities) = 'object')`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_run_jobs_required_caps ON run_jobs USING GIN (required_capabilities)`);
-        await this.pool.query(`ALTER TABLE worker_nodes
-       ADD COLUMN IF NOT EXISTS capabilities JSONB`);
-        await this.pool.query(`UPDATE worker_nodes
+       WHERE required_capabilities = 'null'::jsonb`, [], client);
+        await this.runQuery(`ALTER TABLE run_jobs
+       DROP CONSTRAINT IF EXISTS run_jobs_required_capabilities_object_check`, [], client);
+        await this.runQuery(`DO $$
+       BEGIN
+         IF NOT EXISTS (
+           SELECT 1
+           FROM pg_constraint
+           WHERE conname = 'run_jobs_required_capabilities_object_check'
+         ) THEN
+           ALTER TABLE run_jobs
+             ADD CONSTRAINT run_jobs_required_capabilities_object_check
+             CHECK (required_capabilities IS NULL OR jsonb_typeof(required_capabilities) = 'object');
+         END IF;
+       END
+       $$`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS idx_run_jobs_required_caps ON run_jobs USING GIN (required_capabilities)`, [], client);
+        await this.runQuery(`ALTER TABLE worker_nodes
+       ADD COLUMN IF NOT EXISTS capabilities JSONB`, [], client);
+        await this.runQuery(`UPDATE worker_nodes
        SET capabilities = '{}'::jsonb
-       WHERE capabilities IS NULL`);
-        await this.pool.query(`ALTER TABLE worker_nodes
+       WHERE capabilities IS NULL`, [], client);
+        await this.runQuery(`ALTER TABLE worker_nodes
        ALTER COLUMN capabilities SET DEFAULT '{}'::jsonb,
-       ALTER COLUMN capabilities SET NOT NULL`);
+       ALTER COLUMN capabilities SET NOT NULL`, [], client);
     }
-    async migrateAgentRunMetadataSchema() {
-        await this.pool.query(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS metadata JSONB`);
-        await this.pool.query(`UPDATE agent_runs
+    async migrateAgentRunMetadataSchema(client) {
+        await this.runQuery(`ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS metadata JSONB`, [], client);
+        await this.runQuery(`UPDATE agent_runs
        SET metadata = '{}'::jsonb
-       WHERE metadata IS NULL`);
-        await this.pool.query(`ALTER TABLE agent_runs
+       WHERE metadata IS NULL`, [], client);
+        await this.runQuery(`ALTER TABLE agent_runs
        ALTER COLUMN metadata SET DEFAULT '{}'::jsonb,
-       ALTER COLUMN metadata SET NOT NULL`);
+       ALTER COLUMN metadata SET NOT NULL`, [], client);
     }
-    async migrateLearningTelemetrySchema() {
-        await this.pool.query(`CREATE TABLE IF NOT EXISTS learning_events (
+    async migrateLearningTelemetrySchema(client) {
+        await this.runQuery(`CREATE TABLE IF NOT EXISTS learning_events (
          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
          run_id UUID NOT NULL,
          project_id UUID NOT NULL,
@@ -1274,28 +1355,28 @@ export class AppStore {
          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
          outcome TEXT NOT NULL,
          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-       )`);
-        await this.pool.query(`ALTER TABLE learning_events ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
-        await this.pool.query(`ALTER TABLE learning_events ADD COLUMN IF NOT EXISTS project_id UUID`);
-        await this.pool.query(`ALTER TABLE learning_events ADD COLUMN IF NOT EXISTS event_type TEXT`);
-        await this.pool.query(`ALTER TABLE learning_events
+       )`, [], client);
+        await this.runQuery(`ALTER TABLE learning_events ALTER COLUMN id SET DEFAULT gen_random_uuid()`, [], client);
+        await this.runQuery(`ALTER TABLE learning_events ADD COLUMN IF NOT EXISTS project_id UUID`, [], client);
+        await this.runQuery(`ALTER TABLE learning_events ADD COLUMN IF NOT EXISTS event_type TEXT`, [], client);
+        await this.runQuery(`ALTER TABLE learning_events
        ADD COLUMN IF NOT EXISTS delta INTEGER,
        ADD COLUMN IF NOT EXISTS regression_flag BOOLEAN,
        ADD COLUMN IF NOT EXISTS convergence_flag BOOLEAN,
-       ADD COLUMN IF NOT EXISTS metadata JSONB`);
-        await this.pool.query(`ALTER TABLE learning_events ALTER COLUMN step_index DROP NOT NULL`);
-        await this.pool.query(`UPDATE learning_events
+       ADD COLUMN IF NOT EXISTS metadata JSONB`, [], client);
+        await this.runQuery(`ALTER TABLE learning_events ALTER COLUMN step_index DROP NOT NULL`, [], client);
+        await this.runQuery(`UPDATE learning_events
        SET
          project_id = COALESCE(learning_events.project_id, agent_runs.project_id),
          event_type = COALESCE(NULLIF(learning_events.event_type, ''), 'correction')
        FROM agent_runs
-       WHERE agent_runs.id = learning_events.run_id`);
-        await this.pool.query(`UPDATE learning_events
-       SET outcome = COALESCE(NULLIF(learning_events.outcome, ''), 'noop')`);
-        await this.pool.query(`UPDATE learning_events
+       WHERE agent_runs.id = learning_events.run_id`, [], client);
+        await this.runQuery(`UPDATE learning_events
+       SET outcome = COALESCE(NULLIF(learning_events.outcome, ''), 'noop')`, [], client);
+        await this.runQuery(`UPDATE learning_events
        SET metadata = '{}'::jsonb
-       WHERE metadata IS NULL`);
-        await this.pool.query(`UPDATE learning_events
+       WHERE metadata IS NULL`, [], client);
+        await this.runQuery(`UPDATE learning_events
        SET
          delta = CASE
            WHEN blocking_before IS NOT NULL AND blocking_after IS NOT NULL
@@ -1314,34 +1395,34 @@ export class AppStore {
          END
        WHERE delta IS NULL
           OR regression_flag IS NULL
-          OR convergence_flag IS NULL`);
-        await this.pool.query(`ALTER TABLE learning_events
+          OR convergence_flag IS NULL`, [], client);
+        await this.runQuery(`ALTER TABLE learning_events
        ALTER COLUMN project_id SET NOT NULL,
        ALTER COLUMN event_type SET NOT NULL,
        ALTER COLUMN metadata SET DEFAULT '{}'::jsonb,
        ALTER COLUMN metadata SET NOT NULL,
-       ALTER COLUMN outcome SET NOT NULL`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_run_idx ON learning_events(run_id)`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_project_idx ON learning_events(project_id)`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_outcome_idx ON learning_events(outcome)`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS learning_events_clusters_idx ON learning_events USING GIN (clusters)`);
+       ALTER COLUMN outcome SET NOT NULL`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS learning_events_run_idx ON learning_events(run_id)`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS learning_events_project_idx ON learning_events(project_id)`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS learning_events_outcome_idx ON learning_events(outcome)`, [], client);
+        await this.runQuery(`CREATE INDEX IF NOT EXISTS learning_events_clusters_idx ON learning_events USING GIN (clusters)`, [], client);
     }
     async createLifecycleRun(input, client) {
         const runId = input.runId || randomUUID();
         const now = new Date().toISOString();
         const result = await this.runQuery(`INSERT INTO agent_runs (
-         id, project_id, org_id, workspace_id, created_by_user_id, goal,
+         id, project_id, org_id, workspace_id, created_by_user_id, graph_id, goal,
          phase, status, step_index, corrections_used, optimization_steps_used,
          max_steps, max_corrections, max_optimizations,
          provider_id, model, current_step_index, plan, last_step_id, error_message,
          created_at, updated_at, finished_at
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6,
-         $7, $8, $9, $10, $11,
-         $12, $13, $14,
-         'state-machine', NULL, $9, '{}'::jsonb, NULL, $15,
-         $16::timestamptz, $17::timestamptz, NULL
+         $1, $2, $3, $4, $5, $6, $7,
+         $8, $9, $10, $11, $12,
+         $13, $14, $15,
+         'state-machine', NULL, $10, '{}'::jsonb, NULL, $16,
+         $17::timestamptz, $18::timestamptz, NULL
        )
        RETURNING ${lifecycleRunSelectColumns}`, [
             runId,
@@ -1349,6 +1430,7 @@ export class AppStore {
             input.orgId,
             input.workspaceId,
             input.createdByUserId,
+            input.graphId,
             input.goal,
             input.phase,
             input.status,
@@ -1984,9 +2066,9 @@ export class AppStore {
         await this.pool.query(`DELETE FROM auth_sessions
        WHERE id = $1`, [sessionId]);
     }
-    async pruneExpiredSessions() {
-        await this.pool.query(`DELETE FROM auth_sessions
-       WHERE expires_at <= NOW() OR (revoked_at IS NOT NULL AND revoked_at <= NOW() - INTERVAL '30 days')`);
+    async pruneExpiredSessions(client) {
+        await this.runQuery(`DELETE FROM auth_sessions
+       WHERE expires_at <= NOW() OR (revoked_at IS NOT NULL AND revoked_at <= NOW() - INTERVAL '30 days')`, [], client);
     }
     async consumeRateLimit(key, limit, windowSeconds) {
         const nowSeconds = Math.floor(Date.now() / 1000);

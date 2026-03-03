@@ -1,15 +1,6 @@
 import { logError, logInfo } from "../lib/logging.js";
+import { isAllowedStateTransition, lifecycleRunGraph } from "./lifecycle-graph.js";
 import { isActiveAgentRunStatus } from "./run-status.js";
-const allowedTransitions = {
-    queued: ["running", "cancelled", "failed"],
-    running: ["correcting", "optimizing", "validating", "failed", "complete", "cancelled"],
-    correcting: ["running", "validating", "failed", "cancelled"],
-    optimizing: ["running", "validating", "failed", "complete", "cancelled"],
-    validating: ["running", "optimizing", "failed", "complete", "cancelled"],
-    cancelled: [],
-    failed: [],
-    complete: []
-};
 function normalizeLimit(value, fallback, min, max) {
     const candidate = Number(value);
     if (!Number.isFinite(candidate)) {
@@ -28,7 +19,7 @@ export class AgentRunService {
         this.store = store;
     }
     assertTransition(currentStatus, nextStatus) {
-        if (!allowedTransitions[currentStatus].includes(nextStatus)) {
+        if (!isAllowedStateTransition(lifecycleRunGraph, currentStatus, nextStatus)) {
             throw new Error(`Invalid transition: ${currentStatus} -> ${nextStatus}`);
         }
     }
@@ -95,6 +86,7 @@ export class AgentRunService {
             orgId: input.project.orgId,
             workspaceId: input.project.workspaceId,
             createdByUserId: input.createdByUserId,
+            graphId: input.graphId,
             goal: input.goal,
             phase: "goal",
             status: "queued",
@@ -110,6 +102,7 @@ export class AgentRunService {
             requestId: input.requestId,
             runId: run.id,
             projectId: run.projectId,
+            graphId: input.graphId,
             phase: run.phase,
             status: run.status,
             maxSteps: run.maxSteps,
@@ -225,6 +218,7 @@ export class AgentRunService {
             if (run.status !== "cancelled" && run.status !== "failed") {
                 throw new Error("Run can only be resumed from cancelled or failed.");
             }
+            this.assertTransition(run.status, "queued");
             const resumed = (await this.store.updateLifecycleRun(run.id, {
                 status: "queued",
                 errorMessage: null

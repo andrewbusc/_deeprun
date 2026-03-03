@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { AgentRunService } from "../run-service.js";
+import { isAllowedStateTransition, lifecycleRunGraph } from "../lifecycle-graph.js";
 import { AppStore } from "../../lib/project-store.js";
 const databaseUrl = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -77,6 +78,7 @@ test("valid transitions: queued -> running -> cancelled", async () => {
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Transition test",
+            graphId: randomUUID(),
             requestId: "test-transition"
         });
         const running = await harness.service.markRunRunning(harness.project.id, run.id, "test-transition");
@@ -96,6 +98,7 @@ test("invalid transition: complete -> running is rejected", async () => {
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Invalid transition test",
+            graphId: randomUUID(),
             requestId: "test-invalid"
         });
         await harness.service.markRunRunning(harness.project.id, run.id, "test-invalid");
@@ -113,6 +116,7 @@ test("invariant enforcement: step cap fails run before next step", async () => {
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Step cap test",
+            graphId: randomUUID(),
             maxSteps: 1,
             maxOptimizations: 10,
             requestId: "test-step-cap"
@@ -144,6 +148,7 @@ test("cancellation flow: running -> cancelled on worker tick", async () => {
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Cancel test",
+            graphId: randomUUID(),
             requestId: "test-cancel"
         });
         await harness.service.markRunRunning(harness.project.id, run.id, "test-cancel");
@@ -168,6 +173,7 @@ test("resume flow: cancelled/failed -> queued without resetting counters", async
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Resume test",
+            graphId: randomUUID(),
             requestId: "test-resume"
         });
         await harness.service.markRunRunning(harness.project.id, run.id, "test-resume");
@@ -188,6 +194,7 @@ test("idempotency guard: stale expected step index is skipped", async () => {
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Idempotency test",
+            graphId: randomUUID(),
             requestId: "test-idempotency"
         });
         const first = await harness.service.executeNextStep({
@@ -220,6 +227,7 @@ test("optimization phase switch and completion", async () => {
             project: harness.project,
             createdByUserId: harness.userId,
             goal: "Optimization test",
+            graphId: randomUUID(),
             maxSteps: 20,
             maxOptimizations: 2,
             requestId: "test-optimization"
@@ -249,6 +257,81 @@ test("optimization phase switch and completion", async () => {
         });
         assert.equal(step3.outcome, "processed");
         assert.equal(step3.run?.status, "complete");
+    }
+    finally {
+        if (previous === undefined) {
+            delete process.env.AGENT_FAKE_GOAL_STEPS;
+        }
+        else {
+            process.env.AGENT_FAKE_GOAL_STEPS = previous;
+        }
+        await destroyHarness(harness);
+    }
+});
+test("observed lifecycle transitions conform to the canonical graph", async () => {
+    const previous = process.env.AGENT_FAKE_GOAL_STEPS;
+    process.env.AGENT_FAKE_GOAL_STEPS = "1";
+    const harness = await createHarness();
+    const observed = [];
+    const track = (fromStatus, toStatus) => {
+        if (fromStatus && toStatus && fromStatus !== toStatus) {
+            observed.push([fromStatus, toStatus]);
+        }
+    };
+    try {
+        const cancelledRun = await harness.service.createRun({
+            project: harness.project,
+            createdByUserId: harness.userId,
+            goal: "Canonical transition cancel",
+            graphId: randomUUID(),
+            requestId: "test-canonical-cancel"
+        });
+        const cancelledRunning = await harness.service.markRunRunning(harness.project.id, cancelledRun.id, "test-canonical-cancel");
+        track(cancelledRun.status, cancelledRunning.status);
+        const cancelled = await harness.service.markRunCancelled(harness.project.id, cancelledRun.id, "test-canonical-cancel");
+        track(cancelledRunning.status, cancelled.status);
+        const resumedRun = await harness.service.createRun({
+            project: harness.project,
+            createdByUserId: harness.userId,
+            goal: "Canonical transition resume",
+            graphId: randomUUID(),
+            requestId: "test-canonical-resume"
+        });
+        const resumedRunning = await harness.service.markRunRunning(harness.project.id, resumedRun.id, "test-canonical-resume");
+        track(resumedRun.status, resumedRunning.status);
+        const failed = await harness.service.markRunFailed(harness.project.id, resumedRun.id, "test-canonical-resume", "simulated failure");
+        track(resumedRunning.status, failed.status);
+        const resumed = await harness.service.resumeRun(harness.project.id, resumedRun.id, "test-canonical-resume");
+        track(failed.status, resumed.status);
+        const optimizationRun = await harness.service.createRun({
+            project: harness.project,
+            createdByUserId: harness.userId,
+            goal: "Canonical transition optimization",
+            graphId: randomUUID(),
+            maxSteps: 10,
+            maxOptimizations: 1,
+            requestId: "test-canonical-optimization"
+        });
+        const optimizationRunning = await harness.service.markRunRunning(harness.project.id, optimizationRun.id, "test-canonical-optimization");
+        track(optimizationRun.status, optimizationRunning.status);
+        const firstStep = await harness.service.executeNextStep({
+            projectId: harness.project.id,
+            runId: optimizationRun.id,
+            requestId: "test-canonical-optimization",
+            expectedStepIndex: 0
+        });
+        track(optimizationRunning.status, firstStep.run?.status);
+        const secondStep = await harness.service.executeNextStep({
+            projectId: harness.project.id,
+            runId: optimizationRun.id,
+            requestId: "test-canonical-optimization",
+            expectedStepIndex: 1
+        });
+        track(firstStep.run?.status, secondStep.run?.status);
+        assert.ok(observed.length > 0);
+        for (const [fromStatus, toStatus] of observed) {
+            assert.equal(isAllowedStateTransition(lifecycleRunGraph, fromStatus, toStatus), true, `Observed transition ${fromStatus} -> ${toStatus} is not in the canonical graph.`);
+        }
     }
     finally {
         if (previous === undefined) {

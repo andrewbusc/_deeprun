@@ -67,6 +67,15 @@ function runCommand(input) {
         let stdout = "";
         let stderr = "";
         let combined = `$ ${shellSafeCommand(input.command, input.args)}\n`;
+        let settled = false;
+        const finish = (result) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timeout);
+            resolve(result);
+        };
         child.stdout.on("data", (chunk) => {
             const text = chunk.toString("utf8");
             stdout = truncateOutput(stdout + text);
@@ -85,8 +94,17 @@ function runCommand(input) {
                 }
             }, 1_000).unref();
         }, timeoutMs);
+        child.on("error", (error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            finish({
+                ok: false,
+                stdout: stdout.trim(),
+                stderr: message,
+                exitCode: 1,
+                combined: truncateOutput(`${combined}${message}`).trim()
+            });
+        });
         child.on("close", (code) => {
-            clearTimeout(timeout);
             const exitCode = Number.isInteger(code) ? Number(code) : 1;
             const result = {
                 ok: exitCode === 0,
@@ -96,13 +114,13 @@ function runCommand(input) {
                 combined: combined.trim()
             };
             if (!result.ok && !input.allowFailure) {
-                resolve({
+                finish({
                     ...result,
                     stderr: result.stderr || `${input.command} exited with code ${String(code ?? "unknown")}.`
                 });
                 return;
             }
-            resolve({
+            finish({
                 ...result
             });
         });

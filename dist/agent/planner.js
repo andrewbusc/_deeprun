@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { collectFiles } from "../lib/fs-utils.js";
 import { agentPlanSchema, agentStepSchema, withAgentPlanCapabilities, withAgentStepCapabilities } from "./types.js";
+import { readBasEnv } from "./bas-env.js";
 function parseRequestTimeoutMs(value, fallbackMs) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed < 1_000) {
@@ -9,7 +10,7 @@ function parseRequestTimeoutMs(value, fallbackMs) {
     }
     return Math.floor(parsed);
 }
-const defaultPlannerTimeoutMs = parseRequestTimeoutMs(process.env.DEEPRUN_PLANNER_TIMEOUT_MS, 120_000);
+const defaultPlannerTimeoutMs = parseRequestTimeoutMs(readBasEnv({ key: "DEEPRUN_PLANNER_TIMEOUT_MS", file: "src/agent/planner.ts" }), 120_000);
 const planResponseSchemaLiteral = `{
   "goal": "string",
   "steps": [
@@ -32,18 +33,18 @@ const correctionResponseSchemaLiteral = `{
 const correctionStepSchema = agentStepSchema.refine((step) => step.type === "modify" && (step.tool === "write_file" || step.tool === "apply_patch"), "Correction step must be a modify step that uses write_file or apply_patch.");
 function getProviderConfig(providerId) {
     if (providerId === "openai") {
-        const apiKey = process.env.OPENAI_API_KEY || "";
-        const baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
-        const defaultModel = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+        const apiKey = readBasEnv({ key: "OPENAI_API_KEY", file: "src/agent/planner.ts" }) || "";
+        const baseUrl = readBasEnv({ key: "OPENAI_BASE_URL", file: "src/agent/planner.ts" }) || "https://api.openai.com/v1";
+        const defaultModel = readBasEnv({ key: "OPENAI_MODEL", file: "src/agent/planner.ts" }) || "gpt-4.1-mini";
         if (!apiKey) {
             throw new Error("OPENAI_API_KEY is not configured.");
         }
         return { apiKey, baseUrl, defaultModel };
     }
     if (providerId === "openrouter") {
-        const apiKey = process.env.OPENROUTER_API_KEY || "";
-        const baseUrl = process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-        const defaultModel = process.env.OPENROUTER_MODEL || "openai/gpt-4.1-mini";
+        const apiKey = readBasEnv({ key: "OPENROUTER_API_KEY", file: "src/agent/planner.ts" }) || "";
+        const baseUrl = readBasEnv({ key: "OPENROUTER_BASE_URL", file: "src/agent/planner.ts" }) || "https://openrouter.ai/api/v1";
+        const defaultModel = readBasEnv({ key: "OPENROUTER_MODEL", file: "src/agent/planner.ts" }) || "openai/gpt-4.1-mini";
         if (!apiKey) {
             throw new Error("OPENROUTER_API_KEY is not configured.");
         }

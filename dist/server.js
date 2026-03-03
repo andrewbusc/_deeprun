@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { validateEnvironment } from "./lib/env-config.js";
 import cors from "cors";
 import express from "express";
 import { promises as fs } from "node:fs";
@@ -6,17 +7,20 @@ import net from "node:net";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { ZodError, z } from "zod";
 import { FileSession } from "./agent/fs/file-session.js";
 import { buildTree, ensureDir, pathExists, readTextFile, safeResolvePath } from "./lib/fs-utils.js";
 import { AppStore } from "./lib/project-store.js";
+import { GraphStore } from "./lib/graph-store.js";
+import { enforceRuntimeCompatibility } from "./lib/runtime-compatibility.js";
 import { ProviderRegistry } from "./lib/providers.js";
 import { workspacePath } from "./lib/workspace.js";
 import { AgentKernel } from "./agent/kernel.js";
 import { AgentRunService } from "./agent/run-service.js";
 import { AgentRunWorker } from "./agent/run-worker.js";
 import { runV1ReadinessCheck } from "./agent/validation/check-v1-ready.js";
+import { buildGovernanceDecision } from "./governance/decision.js";
 import { getTemplate, listTemplates } from "./templates/catalog.js";
 import { hashPassword, verifyPassword } from "./lib/auth.js";
 import { slugify } from "./lib/strings.js";
@@ -82,8 +86,24 @@ const createAgentRunSchema = z.object({
     correctionConvergenceMode: executionValidationModeSchema.optional(),
     plannerTimeoutMs: z.number().int().min(1_000).max(300_000).optional()
 });
+const resumeAgentRunSchema = z.object({
+    profile: z.enum(["full", "ci", "smoke"]).optional(),
+    lightValidationMode: executionValidationModeSchema.optional(),
+    heavyValidationMode: executionValidationModeSchema.optional(),
+    maxRuntimeCorrectionAttempts: z.number().int().min(0).max(5).optional(),
+    maxHeavyCorrectionAttempts: z.number().int().min(0).max(3).optional(),
+    correctionPolicyMode: executionValidationModeSchema.optional(),
+    correctionConvergenceMode: executionValidationModeSchema.optional(),
+    plannerTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+    overrideExecutionConfig: z.boolean().default(false),
+    fork: z.boolean().default(false)
+});
 const validateAgentRunSchema = z.object({
     strictV1Ready: z.boolean().default(false)
+});
+const governanceDecisionRequestSchema = z.object({
+    runId: z.string().uuid(),
+    strictV1Ready: z.boolean().optional()
 });
 const createAgentStateRunSchema = z.object({
     goal: z.string().min(4).max(24_000),
@@ -107,9 +127,11 @@ const createDeploymentSchema = z.object({
     customDomain: z.string().trim().max(255).optional(),
     containerPort: z.number().int().min(1).max(65535).optional()
 });
+// import { createGovernanceRoutes } from './governance-routes.js';
 const app = express();
 app.disable("x-powered-by");
 const store = new AppStore();
+const graphStore = new GraphStore(store.pool);
 const providers = new ProviderRegistry();
 const agentKernel = new AgentKernel({ store, providers });
 const agentRunService = new AgentRunService(store);
@@ -274,11 +296,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(rootDir, "public");
+function buildValidationResultPayload(input) {
+    return {
+        targetPath: input.targetPath,
+        validation: input.validation,
+        governance: {
+            strictV1Ready: input.strictV1Ready === true
+        },
+        ...(input.v1Ready ? { v1Ready: input.v1Ready } : {})
+    };
+}
+function readPersistedStrictV1Ready(value) {
+    const record = value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    const governance = record?.governance && typeof record.governance === "object" && !Array.isArray(record.governance)
+        ? record.governance
+        : null;
+    return governance?.strictV1Ready === true;
+}
 class HttpError extends Error {
     status;
-    constructor(status, message) {
+    details;
+    constructor(status, message, details) {
         super(message);
         this.status = status;
+        this.details = details;
     }
 }
 function isPgUniqueViolation(error) {
@@ -490,6 +531,7 @@ app.use((req, res, next) => {
     res.setHeader("Connection", "close");
     res.status(503).json({ error: "Server is shutting down." });
 });
+// app.use('/api', createGovernanceRoutes(store, agentRunService));
 app.use(express.static(publicDir));
 async function enforceRateLimit(req, res, options) {
     const decision = await store.consumeRateLimit(options.key, options.limit, options.windowSec);
@@ -791,6 +833,16 @@ async function runBootstrapCertification(input) {
         const summary = summarizeFailedChecks(validated.validation.checks);
         const violations = extractValidationViolations(validated.validation.checks);
         const stepIndex = Math.max(Number(validated.run.currentStepIndex || 0), Array.isArray(validated.run.plan?.steps) ? validated.run.plan.steps.length : 0);
+        const validationResultPayload = buildValidationResultPayload({
+            targetPath: validated.targetPath,
+            validation: validated.validation,
+            strictV1Ready: readPersistedStrictV1Ready(validated.run.validationResult)
+        });
+        await store.updateAgentRun(validated.run.id, {
+            validationStatus: validated.validation.ok ? "passed" : "failed",
+            validationResult: validationResultPayload,
+            validatedAt
+        });
         const certificationStep = await store.createAgentStep({
             runId: validated.run.id,
             projectId: validated.run.projectId,
@@ -834,6 +886,30 @@ async function runBootstrapCertification(input) {
         try {
             const run = await store.getAgentRunById(input.project.id, input.runId);
             if (run) {
+                await store.updateAgentRun(run.id, {
+                    validationStatus: "failed",
+                    validationResult: buildValidationResultPayload({
+                        targetPath: store.getProjectWorkspacePath(input.project),
+                        validation: {
+                            ok: false,
+                            blockingCount: 1,
+                            warningCount: 0,
+                            summary: "Bootstrap certification execution failed.",
+                            checks: [
+                                {
+                                    id: "certification",
+                                    status: "fail",
+                                    message,
+                                    details: {
+                                        source: "bootstrap"
+                                    }
+                                }
+                            ]
+                        },
+                        strictV1Ready: false
+                    }),
+                    validatedAt
+                });
                 const stepIndex = Math.max(Number(run.currentStepIndex || 0), Array.isArray(run.plan?.steps) ? run.plan.steps.length : 0);
                 const certificationStep = await store.createAgentStep({
                     runId: run.id,
@@ -2064,6 +2140,7 @@ app.post("/api/projects/:projectId/agent/runs/:runId/resume", authRequired, asyn
         const auth = getAuth(req);
         const requestId = getRequestId(req);
         const project = await requireProjectAccess(auth.user.id, req.params.projectId);
+        const parsed = resumeAgentRunSchema.parse(req.body ?? {});
         await enforceRateLimit(req, res, {
             key: `generate:${auth.user.id}`,
             limit: rateLimitConfig.generationMax,
@@ -2075,16 +2152,43 @@ app.post("/api/projects/:projectId/agent/runs/:runId/resume", authRequired, asyn
             detail = await agentKernel.queueResumeRun({
                 project,
                 runId: req.params.runId,
-                requestId
+                requestId,
+                createdByUserId: auth.user.id,
+                executionConfig: {
+                    ...(parsed.profile ? { profile: parsed.profile } : {}),
+                    ...(parsed.lightValidationMode ? { lightValidationMode: parsed.lightValidationMode } : {}),
+                    ...(parsed.heavyValidationMode ? { heavyValidationMode: parsed.heavyValidationMode } : {}),
+                    ...(typeof parsed.maxRuntimeCorrectionAttempts === "number"
+                        ? { maxRuntimeCorrectionAttempts: parsed.maxRuntimeCorrectionAttempts }
+                        : {}),
+                    ...(typeof parsed.maxHeavyCorrectionAttempts === "number"
+                        ? { maxHeavyCorrectionAttempts: parsed.maxHeavyCorrectionAttempts }
+                        : {}),
+                    ...(parsed.correctionPolicyMode ? { correctionPolicyMode: parsed.correctionPolicyMode } : {}),
+                    ...(parsed.correctionConvergenceMode ? { correctionConvergenceMode: parsed.correctionConvergenceMode } : {}),
+                    ...(typeof parsed.plannerTimeoutMs === "number" ? { plannerTimeoutMs: parsed.plannerTimeoutMs } : {})
+                },
+                overrideExecutionConfig: parsed.overrideExecutionConfig,
+                fork: parsed.fork
             });
         }
         catch (error) {
             if (error instanceof Error && error.message === "Agent run not found.") {
                 throw new HttpError(404, "Agent run not found.");
             }
+            if (error instanceof Error &&
+                error.message.startsWith("Execution config mismatch.")) {
+                throw new HttpError(409, error.message, error instanceof Error && "diff" in error
+                    ? {
+                        diff: error.diff,
+                        persisted: error.persisted,
+                        requested: error.requested
+                    }
+                    : undefined);
+            }
             throw error;
         }
-        res.status(detail.queuedJob ? 202 : 200).json(detail);
+        res.status(parsed.fork ? 201 : detail.queuedJob ? 202 : 200).json(detail);
     }
     catch (error) {
         next(error);
@@ -2150,11 +2254,12 @@ app.post("/api/projects/:projectId/agent/runs/:runId/validate", authRequired, as
                 };
             }
         }
-        const validationResultPayload = {
+        const validationResultPayload = buildValidationResultPayload({
             targetPath: result.targetPath,
             validation: result.validation,
-            ...(v1Ready ? { v1Ready } : {})
-        };
+            v1Ready,
+            strictV1Ready: parsed.strictV1Ready || readPersistedStrictV1Ready(result.run.validationResult)
+        });
         const persistedRun = (await store.updateAgentRun(result.run.id, {
             validationStatus: result.validation.ok ? "passed" : "failed",
             validationResult: validationResultPayload,
@@ -2204,10 +2309,29 @@ app.post("/api/projects/:projectId/agent/state-runs", authRequired, async (req, 
         const requestId = getRequestId(req);
         const project = await requireProjectAccess(auth.user.id, req.params.projectId);
         const parsed = createAgentStateRunSchema.parse(req.body ?? {});
+        const runId = randomUUID();
+        const executionIdentityHash = createHash("sha256")
+            .update(JSON.stringify({
+            provider: "state-machine",
+            goal: parsed.goal,
+            maxSteps: parsed.maxSteps || 20,
+            maxCorrections: parsed.maxCorrections || 2,
+            maxOptimizations: parsed.maxOptimizations || 2
+        }))
+            .digest("hex");
+        const graph = await graphStore.createSingleNodeGraph({
+            projectId: project.id,
+            orgId: project.orgId,
+            workspaceId: project.workspaceId,
+            createdByUserId: auth.user.id,
+            runId,
+            executionIdentityHash
+        });
         const run = await agentRunService.createRun({
             project,
             createdByUserId: auth.user.id,
             goal: parsed.goal,
+            graphId: graph.id,
             maxSteps: parsed.maxSteps,
             maxCorrections: parsed.maxCorrections,
             maxOptimizations: parsed.maxOptimizations,
@@ -2313,6 +2437,25 @@ app.post("/api/projects/:projectId/agent/state-runs/:runId/tick", authRequired, 
             expectedStepIndex: parsed.expectedStepIndex
         });
         res.json(result);
+    }
+    catch (error) {
+        next(error);
+    }
+});
+app.post("/api/projects/:projectId/governance/decision", authRequired, async (req, res, next) => {
+    try {
+        const auth = getAuth(req);
+        const project = await requireProjectAccess(auth.user.id, req.params.projectId);
+        const parsed = governanceDecisionRequestSchema.parse(req.body ?? {});
+        const detail = await agentKernel.getRunWithSteps(project.id, parsed.runId);
+        if (!detail) {
+            throw new HttpError(404, "Agent run not found.");
+        }
+        const persistedStrictV1Ready = readPersistedStrictV1Ready(detail.run.validationResult);
+        if (typeof parsed.strictV1Ready === "boolean" && parsed.strictV1Ready !== persistedStrictV1Ready) {
+            throw new HttpError(409, `Governance mode mismatch. Persisted strictV1Ready=${String(persistedStrictV1Ready)} for run ${detail.run.id}.`);
+        }
+        res.json(buildGovernanceDecision({ detail }));
     }
     catch (error) {
         next(error);
@@ -2669,9 +2812,13 @@ app.use((error, req, res, _next) => {
         logError("http.error", {
             requestId,
             statusCode: error.status,
+            details: error.details,
             ...serializeError(error)
         });
-        return res.status(error.status).json({ error: error.message });
+        return res.status(error.status).json({
+            error: error.message,
+            ...(error.details !== undefined ? { details: error.details } : {})
+        });
     }
     logError("http.error.unhandled", {
         requestId,
@@ -2680,8 +2827,23 @@ app.use((error, req, res, _next) => {
     return res.status(500).json({ error: "Internal server error." });
 });
 async function main() {
+    // Validate environment configuration (fail fast)
+    const config = validateEnvironment();
+    logInfo("server.config_validated", {
+        nodeEnv: config.nodeEnv,
+        port: config.port,
+        corsOrigins: config.corsAllowedOrigins.length,
+        providersConfigured: [
+            config.providers.openaiApiKey ? 'openai' : null,
+            config.providers.anthropicApiKey ? 'anthropic' : null,
+        ].filter(Boolean),
+        metricsEnabled: config.metrics.enabled,
+    });
     await store.initialize();
-    const port = Number(process.env.PORT || 3000);
+    await graphStore.initializeSchema();
+    // Validate runtime compatibility BEFORE starting HTTP server
+    await enforceRuntimeCompatibility(store.pool);
+    const port = config.port;
     httpServer = await new Promise((resolve, reject) => {
         const server = app.listen(port, () => resolve(server));
         server.once("error", reject);
@@ -2689,8 +2851,8 @@ async function main() {
     serverLifecycleState = "ready";
     logInfo("server.started", {
         port,
-        origins: corsAllowedOrigins,
-        trustProxy
+        origins: config.corsAllowedOrigins,
+        trustProxy: config.trustProxy
     });
     console.log(`deeprun running at http://localhost:${port}`);
 }
