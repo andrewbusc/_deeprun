@@ -643,6 +643,7 @@ button:disabled {
   gap: 0.95rem;
   grid-template-columns: 1fr;
   margin-top: 0.95rem;
+  max-width: 900px;
 }
 
 .review-grid {
